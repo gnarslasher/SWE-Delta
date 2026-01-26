@@ -474,6 +474,25 @@ function addDurationControl() {
             divider.setAttribute('aria-hidden', 'true');
             row.appendChild(divider);
 
+            // State selector (unwired for now) placed immediately below the divider
+            const stateSelect = document.createElement('select');
+            stateSelect.id = 'snotel-state-select';
+            stateSelect.style.fontSize = '13px';
+            stateSelect.style.padding = '6px';
+            stateSelect.style.borderRadius = '4px';
+            stateSelect.style.border = '1px solid #cfcfcf';
+            stateSelect.style.marginBottom = '8px';
+            const states = ['AK', 'WA', 'ID', 'MT', 'OR', 'WY', 'CA', 'NV', 'UT', 'CO', 'NM', 'AZ'];
+            for (const s of states) {
+                const opt = document.createElement('option');
+                opt.value = s;
+                opt.textContent = s;
+                stateSelect.appendChild(opt);
+            }
+            // default selection: MT
+            stateSelect.value = 'MT';
+            row.appendChild(stateSelect);
+
             const now = new Date();
             const defaultTo = toDatetimeLocal(now);
             const defaultFrom = toDatetimeLocal(new Date(now.getTime() - 10 * 3600 * 1000));
