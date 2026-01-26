@@ -1,8 +1,21 @@
 #leaflet_map {
-    /* Height is set dynamically to fit the viewport minus header via JS */
+    /* Use flex so the map fills remaining viewport under the header */
+    flex: 1 1 auto;
     min-height: 320px;
     width: 100%;
     position: relative; /* contain loading overlay */
+    min-width: 0;
+}
+
+html, body {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
 }
 
 /* Loading overlay that covers the map while data is fetched */
@@ -157,6 +170,41 @@
 }
 .snotel-legend .legend-label { font-size: 12px; color: #333; }
 
+/* Legend header and toggle for collapse/expand */
+.snotel-legend .legend-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.snotel-legend .legend-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #111;
+}
+.snotel-legend .legend-toggle {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 4px;
+    color: #333;
+}
+.snotel-legend .legend-toggle:focus {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(74,144,226,0.12);
+}
+
+/* Collapsed state hides the legend content but keeps header visible */
+.snotel-legend.collapsed {
+    width: auto;
+}
+.snotel-legend.collapsed .legend-content {
+    display: none;
+}
+
 /* Slightly enlarge marker on hover */
 .snotel-pin:hover { transform: scale(1.08); }
 
@@ -199,6 +247,7 @@
     width: auto;
     min-width: 200px;
     max-width: 340px;
+    box-sizing: border-box;
 }
 .snotel-control-panel h4 {
     margin: 0 0 8px 0;
@@ -206,6 +255,27 @@
     font-weight: 700;
     color: #222;
 }
+.snotel-control-panel .control-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.snotel-control-panel .control-header h4 { margin: 0; }
+.snotel-control-panel .control-toggle {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    color: #333;
+}
+.snotel-control-panel .control-toggle:focus { outline: none; box-shadow: 0 0 0 3px rgba(74,144,226,0.12); }
+
+/* Collapsed state hides the control content but keeps header visible */
+.snotel-control-panel.collapsed .control-content { display: none; }
 .snotel-control-panel .control-row {
     display: flex;
     flex-direction: column;
@@ -305,4 +375,35 @@
     .snowflake { align-self: flex-end; }
     .main-title { font-size: 1.4rem; }
     .main-header .snotel-subtitle { font-size: 1rem; }
+}
+
+/* Tablet breakpoint: make control panel more flexible */
+@media (max-width: 900px) {
+    .snotel-control-panel { max-width: none; width: 320px; }
+    .main-header-inner { padding: 0 12px; }
+}
+
+/* Phone-specific adjustments: stack controls, full-width panels, larger touch targets */
+@media (max-width: 480px) {
+    .snotel-control-panel {
+        width: calc(100% - 24px);
+        min-width: 0;
+        max-width: none;
+        padding: 12px;
+    }
+    .snotel-control-panel .snotel-apply-btn,
+    .snotel-control-panel #snotel-duration-apply {
+        padding: 12px 14px;
+        font-size: 16px;
+    }
+    .snotel-control-panel .control-row { gap: 10px; }
+    .snotel-pin { width: 44px; height: 44px; border-radius: 22px; }
+    .snotel-pin-label { font-size: 15px; }
+    .snowflake { display: none; }
+    #loading-overlay .loading-text { font-size: 14px; }
+}
+
+/* Ensure map container can shrink properly on very small viewports */
+@media (max-height: 500px) {
+    #leaflet_map { min-height: 200px; }
 }
