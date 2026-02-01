@@ -100,21 +100,21 @@ body {
 /* Marker styling showing delta value */
 .snotel-div-icon { display: block; }
 .snotel-pin {
-    width: 40px;
-    height: 40px;
-    border-radius: 20px;
+    width: 28px;
+    height: 28px;
+    border-radius: 14px;
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.20);
     border: 2px solid rgba(255,255,255,0.9);
 }
 .snotel-pin-label {
     color: #fff;
     font-weight: 600;
-    font-size: 14px;
+    font-size: 12px;
     line-height: 1;
-    padding: 0 4px;
+    padding: 0 3px;
 }
 .snotel-marker-positive { background: #2b8a3e; }
 .snotel-marker-negative { background: #c0392b; }
@@ -207,6 +207,20 @@ body {
 
 /* Slightly enlarge marker on hover */
 .snotel-pin:hover { transform: scale(1.08); }
+
+/* Lower-left duration badge */
+.snotel-duration-badge {
+    position: absolute;
+    left: 8px;
+    bottom: 8px;
+    background: rgba(255,255,255,0.95);
+    color: #111;
+    padding: 6px 8px;
+    border-radius: 6px;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.08);
+    font-size: 12px;
+    z-index: 1100; /* above most map elements */
+}
 
 
 /* Larger, more readable controls inside the Leaflet duration control */
@@ -390,6 +404,9 @@ body {
         min-width: 0;
         max-width: none;
         padding: 12px;
+        /* allow panel content to scroll on very small screens */
+        max-height: calc(100vh - 80px);
+        overflow: auto;
     }
     .snotel-control-panel .snotel-apply-btn,
     .snotel-control-panel #snotel-duration-apply {
@@ -401,6 +418,40 @@ body {
     .snotel-pin-label { font-size: 15px; }
     .snowflake { display: none; }
     #loading-overlay .loading-text { font-size: 14px; }
+
+    /* Make selects/inputs/buttons full width and touch friendly */
+    .snotel-control-panel select,
+    .snotel-control-panel input[type="range"],
+    .snotel-control-panel input[type="datetime-local"],
+    .snotel-control-panel .snotel-apply-btn,
+    .snotel-control-panel button.snotel-clear-btn,
+    .snotel-control-panel button.snotel-select-btn {
+        width: 100%;
+        box-sizing: border-box;
+    }
+
+    /* Make the radar/opacity/test row stack vertically */
+    .snotel-control-panel label { display: block; width: 100%; }
+    .snotel-control-panel input[type="checkbox"] { margin-right: 6px; }
+
+    /* State select should be tall enough and full width */
+    #snotel-state-select { min-height: 96px; width: 100% !important; }
+
+    /* Place select all / clear buttons as full-width and stacked */
+    .snotel-control-panel .snotel-select-btn, .snotel-control-panel .snotel-clear-btn {
+        display: block;
+        width: 100%;
+        margin-left: 0 !important;
+        margin-top: 6px;
+    }
+}
+
+/* Tablet tweaks: allow two-column small buttons but stack other inputs */
+@media (max-width: 768px) and (min-width: 481px) {
+    .snotel-control-panel { width: 360px; }
+    #snotel-state-select { min-height: 72px; }
+    .snotel-control-panel .snotel-select-btn, .snotel-control-panel .snotel-clear-btn { width: 48%; display: inline-block; }
+    .snotel-control-panel button.snotel-clear-btn { margin-left: 4%; }
 }
 
 /* Ensure map container can shrink properly on very small viewports */

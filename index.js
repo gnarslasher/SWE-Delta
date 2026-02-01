@@ -1,13 +1,58 @@
 'use strict';
 
-// SNOTEL data (station metadata) is now provided in `snotel_data.js` as a
+// SNOTEL data (station metadata) historically came from `snotel_data.js` as a
 // single `SNOTEL` object keyed by station triplet. Example:
 // SNOTEL['916:MT:SNTL'] -> { name: 'Albro Lake', lat: 45.59723, lon: -111.95902 }
-// Keep the mapping in a separate file to keep this file small.
+// Newer build/exports use `snotel_data_all.js` which defines `SNOTEL_ALL`.
+// For compatibility create a `window.SNOTEL` alias when `SNOTEL_ALL` is present.
+if (typeof window !== 'undefined' && typeof SNOTEL === 'undefined' && typeof SNOTEL_ALL !== 'undefined') {
+    // If SNOTEL_ALL is the newer state-keyed object (state -> [stations]),
+    // build a flat mapping `SNOTEL[triplet] = { name, lat, lon }` so existing
+    // code that expects SNOTEL by triplet continues to work.
+    try {
+        // Detect grouped-by-state format: values are arrays with `id` fields
+        const sampleKeys = Object.keys(SNOTEL_ALL || {});
+        const firstVal = sampleKeys.length ? SNOTEL_ALL[sampleKeys[0]] : null;
+        if (Array.isArray(firstVal)) {
+            const flat = {};
+            for (const st of sampleKeys) {
+                const arr = Array.isArray(SNOTEL_ALL[st]) ? SNOTEL_ALL[st] : [];
+                for (const rec of arr) {
+                    if (rec && rec.id) {
+                        flat[rec.id] = { name: rec.name || '', lat: rec.lat, lon: rec.lon };
+                    }
+                }
+            }
+            window.SNOTEL = flat;
+            // also expose SNOTEL_BY_STATE for future use
+            window.SNOTEL_BY_STATE = SNOTEL_ALL;
+        } else {
+            // If it's already a flat mapping, just alias it
+            window.SNOTEL = SNOTEL_ALL;
+        }
+    } catch (e) {
+        console.error('Error normalizing SNOTEL_ALL:', e);
+        window.SNOTEL = {};
+    }
+}
 
 let map = null;
+// Enable verbose debug logging during development (set to `true` locally)
+const DEBUG = false;
 // Current base tile layer so we can swap providers
 let baseLayer = null;
+// Optional radar overlay tile layer (added/removed by user)
+let radarLayer = null;
+// debounce handle for window resize events
+let resizeTimeout = null;
+// Radar tile template (RainViewer). {time} will be replaced with the latest timestamp.
+const RADAR_TILE_TEMPLATE = 'https://tilecache.rainviewer.com/v2/radar/{time}/256/{z}/{x}/{y}/2/1_0.png';
+let radarTileErrorCount = 0;
+let radarTileLoadCount = 0;
+let radarTimestamp = null;
+// Default opacity (0.0 - 1.0). Persisted in localStorage under this key.
+let RADAR_OPACITY = 0.6;
+const RADAR_OPACITY_KEY = 'snotelRadarOpacity';
 // Layer group to hold markers so we can clear/refresh easily
 let markersLayer = null;
 // Optional manual date range (strings in 'YYYY-MM-DD HH:MM' format). When set,
@@ -105,44 +150,72 @@ function escapeHtml(str) {
  * Fetch SWE (WTEQ) data for all configured SNOTEL sites.
  * Uses `TimeBefore` to compute a beginDate for the API.
  * Returns an object mapping station triplet -> JSON response (or null on error).
+ *
+ * Note: Large station lists are split into smaller chunked requests to avoid
+ * overly long query URLs which can cause the AWDB request to fail.
  */
-async function getSnotelSwe(TimeBefore = TIME_COUNT, duration = DATA_DURATION) {
+async function getSnotelSwe(tripletList = null, TimeBefore = TIME_COUNT, duration = DATA_DURATION) {
     const sweData = {};
     const beginDate = SNOTEL_BEGIN || computeBeginDate(TimeBefore, duration);
     const endDate = SNOTEL_END || computeEndDate();
-    // Initialize all triplet keys to null so callers can rely on keys existing
-    const triplets = Object.keys(SNOTEL || {});
+
+    // Use provided tripletList when available, otherwise fall back to all SNOTEL keys
+    const triplets = Array.isArray(tripletList) && tripletList.length ? tripletList.slice() : Object.keys(SNOTEL || {});
     for (const t of triplets) sweData[t] = null;
 
     if (triplets.length === 0) return sweData;
 
-    // Build a single request for all triplets. encodeURIComponent will encode
-    // colons as %3A and commas as %2C which the AWDB API accepts.
-    const tripletParam = encodeURIComponent(triplets.join(','));
-    const url = `https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data?stationTriplets=${tripletParam}&elements=WTEQ&duration=${encodeURIComponent(duration)}&beginDate=${beginDate}&endDate=${endDate}&periodRef=START&centralTendencyType=NONE&returnFlags=false&returnOriginalValues=false&returnSuspectData=false`;
-    try {
-        const resp = await fetch(url);
-        if (!resp.ok) {
-            console.warn(`Fetching multiple triplets failed: ${resp.status}`);
-            return sweData;
-        }
-        const json = await resp.json();
+    // To avoid very long URLs (which may cause the AWDB call to fail) split
+    // the station list into manageable chunks and fetch them one at a time.
+    const CHUNK_SIZE = 50; // safe chunk size; adjust if needed
+    const chunks = [];
+    for (let i = 0; i < triplets.length; i += CHUNK_SIZE) {
+        chunks.push(triplets.slice(i, i + CHUNK_SIZE));
+    }
 
-        // The API returns an array of station objects. Each object should have
+    // Fire all chunked requests in parallel and merge results. Use
+    // Promise.allSettled so a few failed chunks won't abort the whole batch.
+    const chunkPromises = chunks.map(async (chunk) => {
+        const tripletParam = encodeURIComponent(chunk.join(','));
+        const url = `https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data?stationTriplets=${tripletParam}&elements=WTEQ&duration=${encodeURIComponent(duration)}&beginDate=${beginDate}&endDate=${endDate}&periodRef=START&centralTendencyType=NONE&returnFlags=false&returnOriginalValues=false&returnSuspectData=false`;
+        try {
+            if (DEBUG) console.debug('Requesting AWDB for triplets (parallel):', chunk.length, chunk.slice(0, 5));
+            const resp = await fetch(url);
+            if (!resp.ok) {
+                console.warn(`Fetching triplet chunk failed: ${resp.status}`);
+                return { chunk, json: null };
+            }
+            const json = await resp.json();
+            return { chunk, json };
+        } catch (err) {
+            console.error('Error fetching triplet chunk (parallel):', err);
+            return { chunk, json: null };
+        }
+    });
+
+    const settled = await Promise.allSettled(chunkPromises);
+    for (const s of settled) {
+        if (s.status !== 'fulfilled' || !s.value || !s.value.json) continue;
+        const { chunk, json } = s.value;
+        // The API commonly returns an array of station objects. Each object should have
         // a `stationTriplet` property. To keep compatibility with the rest of
         // this code (which expects data[triplet] to be an array), store the
         // returned object inside an array at sweData[triplet].
         if (Array.isArray(json)) {
             for (const item of json) {
                 const key = item && (item.stationTriplet || item.station || item.stationId || null);
-                if (key && triplets.includes(key)) {
+                if (key && chunk.includes(key)) {
                     sweData[key] = [item];
                 }
             }
+        } else if (json && typeof json === 'object') {
+            // Some responses may be keyed by triplet
+            for (const k of Object.keys(json)) {
+                if (chunk.includes(k)) sweData[k] = [json[k]];
+            }
         }
-    } catch (err) {
-        console.error('Error fetching multiple triplets:', err);
     }
+
     return sweData;
 }
 
@@ -248,14 +321,40 @@ function initMap(center = [46.5483, -110.9022], zoom = 7) {
     }).addTo(map);
     // create a layer group for markers so we can clear them on refresh
     markersLayer = L.layerGroup().addTo(map);
+    // create a dedicated pane for radar overlay tiles so they render between
+    // base tiles and overlay panes (and so we can control pointer behavior)
+    if (!map.getPane('radarPane')) {
+        map.createPane('radarPane');
+        const rp = map.getPane('radarPane');
+        // zIndex chosen to sit between tilePane (200) and overlayPane (400)
+        rp.style.zIndex = 350;
+        // allow clicks to pass through to markers and the map
+        rp.style.pointerEvents = 'none';
+    }
     // add legend to the map
     addLegend();
+
+    // Create a lower-left duration badge showing the current From/To range
+    // (keeps the user aware of the date range being used by the plots)
+    try {
+        const mapEl = document.getElementById('leaflet_map');
+        if (mapEl && !document.getElementById('snotel-duration-badge')) {
+            const badge = document.createElement('div');
+            badge.id = 'snotel-duration-badge';
+            badge.className = 'snotel-duration-badge';
+            badge.style.display = 'none';
+            mapEl.appendChild(badge);
+        }
+    } catch (e) { /* ignore */ }
 }
 
-// Keep map sized correctly when window changes
+// Keep map sized correctly when window changes (debounced)
 window.addEventListener('resize', function () {
-    adjustMapHeight();
-    if (map && typeof map.invalidateSize === 'function') map.invalidateSize();
+    if (resizeTimeout) clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(function () {
+        adjustMapHeight();
+        if (map && typeof map.invalidateSize === 'function') map.invalidateSize();
+    }, 200);
 });
 
 /**
@@ -281,12 +380,15 @@ function addLegend() {
 
         const toggle = document.createElement('button');
         toggle.className = 'legend-toggle';
-        toggle.setAttribute('aria-expanded', 'true');
-        toggle.title = 'Collapse legend';
-        toggle.innerHTML = '\u2212'; // minus sign
+        // default to collapsed
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.title = 'Expand legend';
+        toggle.innerHTML = '+'; // plus sign
         header.appendChild(toggle);
 
         container.appendChild(header);
+        // start collapsed by default so legend is minimized on load
+        container.classList.add('collapsed');
 
         const content = document.createElement('div');
         content.className = 'legend-content';
@@ -381,35 +483,192 @@ function setBaseLayer(provider) {
 }
 
 /**
+ * Helper: fetch latest RainViewer timestamp for radar tiles.
+ * Returns a string timestamp (seconds since epoch) or null.
+ */
+async function fetchRainViewerLatestTime() {
+    try {
+        const resp = await fetch('https://api.rainviewer.com/public/maps.json');
+        if (!resp.ok) return null;
+        const json = await resp.json();
+        if (Array.isArray(json) && json.length) return String(json[json.length - 1]);
+        return null;
+    } catch (e) {
+        console.warn('Error fetching RainViewer maps.json:', e);
+        return null;
+    }
+}
+
+/**
+ * Show or hide a radar overlay tile layer (RainViewer).
+ * The layer is added with reduced opacity and a zIndex underneath markers.
+ * @param {boolean} show
+ */
+async function setRadarOverlay(show) {
+    if (!map) return;
+    const statusEl = document.getElementById('snotel-radar-status');
+    if (!show) {
+        if (radarLayer) {
+            try { map.removeLayer(radarLayer); } catch (e) { /* ignore */ }
+            radarLayer = null;
+        }
+        if (statusEl) statusEl.textContent = '';
+        try {
+            const opacityEl = document.getElementById('snotel-radar-opacity');
+            if (opacityEl && opacityEl.parentElement) opacityEl.parentElement.style.display = 'none';
+        } catch (e) { /* ignore */ }
+        return;
+    }
+
+    radarTileErrorCount = 0;
+    radarTileLoadCount = 0;
+
+    // add initial layer (placeholder time will be updated once we fetch latest)
+    const initialUrl = RADAR_TILE_TEMPLATE.replace('{time}', radarTimestamp || '0');
+    radarLayer = L.tileLayer(initialUrl, { pane: 'radarPane', opacity: RADAR_OPACITY, attribution: 'Radar © RainViewer' });
+
+    radarLayer.on('tileerror', function (ev) {
+        radarTileErrorCount += 1;
+        const src = (ev && ev.tile && ev.tile.src) ? ev.tile.src : (ev && ev.url ? ev.url : '<unknown>');
+        const coords = ev && ev.coords ? `${ev.coords.z}/${ev.coords.y}/${ev.coords.x}` : '<no-coords>';
+        console.warn('Radar tile error:', { src, coords, event: ev });
+        if (statusEl) statusEl.textContent = `Radar tile errors: ${radarTileErrorCount}`;
+        if (radarTileErrorCount > 10) {
+            // If too many errors, remove layer and notify user
+            try { map.removeLayer(radarLayer); } catch (e) { /* ignore */ }
+            radarLayer = null;
+            if (statusEl) statusEl.textContent = 'Radar unavailable';
+            try {
+                const chk = document.getElementById('snotel-radar-toggle');
+                if (chk) chk.checked = false;
+            } catch (ex) { /* ignore */ }
+        }
+    });
+
+    radarLayer.on('tileload', function () {
+        radarTileLoadCount += 1;
+        if (statusEl) statusEl.textContent = `Radar loaded (${radarTileLoadCount} tiles)`;
+    });
+
+    radarLayer.addTo(map);
+
+    // show opacity control
+    try {
+        const opacityEl = document.getElementById('snotel-radar-opacity');
+        if (opacityEl && opacityEl.parentElement) opacityEl.parentElement.style.display = 'inline-flex';
+        if (radarLayer && typeof radarLayer.setOpacity === 'function') radarLayer.setOpacity(RADAR_OPACITY);
+    } catch (e) { /* ignore */ }
+
+    // fetch latest timestamp and update the layer URL
+    try {
+        const latest = await fetchRainViewerLatestTime();
+        if (latest) {
+            radarTimestamp = latest;
+            const updatedUrl = RADAR_TILE_TEMPLATE.replace('{time}', latest);
+            if (radarLayer && typeof radarLayer.setUrl === 'function') radarLayer.setUrl(updatedUrl);
+        }
+    } catch (e) {
+        console.warn('Error updating radar layer time:', e);
+    }
+}
+
+/**
  * Main entry: fetch SWE data and plot markers with basic metrics in popups.
  */
 async function plotTodaysSwe(TimeBefore = TIME_COUNT, duration = 'HOURLY') {
     showLoading();
+
+    // Ensure the map and control panel exist before we inspect the selected state.
+    if (!map) {
+        initMap();
+    }
+    // add/ensure duration control (which includes the state selector)
+    addDurationControl();
+    // Clear existing markers if present so the refreshed plot starts clean
+    if (markersLayer) markersLayer.clearLayers();
+
+    // Determine selected states and triplets up-front so we only request needed stations
+    const stateEl = document.getElementById('snotel-state-select');
+    const selectedStates = stateEl ? Array.from(stateEl.selectedOptions).map((o) => String(o.value).toUpperCase()).filter(Boolean) : [];
+    let triplets = [];
+    if (selectedStates.length && window.SNOTEL_BY_STATE && typeof window.SNOTEL_BY_STATE === 'object') {
+        // Aggregate all triplets for the chosen states
+        for (const st of selectedStates) {
+            if (Array.isArray(window.SNOTEL_BY_STATE[st])) {
+                triplets.push(...window.SNOTEL_BY_STATE[st].map((r) => r && r.id).filter(Boolean));
+            }
+        }
+        // de-duplicate
+        triplets = Array.from(new Set(triplets));
+    } else {
+        triplets = Object.keys(SNOTEL || {});
+        if (selectedStates.length) {
+            triplets = triplets.filter((t) => {
+                const parts = String(t).split(':');
+                return selectedStates.includes(((parts[1] || '').toUpperCase()));
+            });
+        }
+    }
+
     let data = null;
     try {
-        data = await getSnotelSwe(TimeBefore, duration);
+        data = await getSnotelSwe(triplets, TimeBefore, duration);
     } catch (err) {
         console.error('Error fetching SWE data:', err);
     }
 
-    // initialize map if needed, otherwise clear existing markers
-    if (!map) {
-        initMap();
-    } else if (markersLayer) {
-        markersLayer.clearLayers();
-    }
-
     const beginDateStr = SNOTEL_BEGIN || computeBeginDate(TimeBefore, duration);
     const beginDateObj = new Date(beginDateStr);
-    const triplets = Object.keys(SNOTEL);
+    // We'll collect the actual entry timestamps used by computeDelta across stations
+    // and show those in the badge so it matches the SWE delta popups.
+    let badgeFirst = null;
+    let badgeLast = null;
+    let badgeFirstDate = null;
+    let badgeLastDate = null;
+    // Update the lower-left badge with the range being used for this plot
+    try {
+        const badge = document.getElementById('snotel-duration-badge');
+        if (badge) {
+            // Prefer timestamps derived from the actual SWE entries (so the badge matches popups)
+            if (badgeFirst || badgeLast) {
+                const fromText = badgeFirst || beginDateStr;
+                const toText = badgeLast || (SNOTEL_END || computeEndDate());
+                badge.textContent = `From ${fromText} to ${toText}`;
+            } else {
+                const endStr = SNOTEL_END || computeEndDate();
+                badge.textContent = `From ${beginDateStr} to ${endStr}`;
+            }
+            badge.style.display = 'block';
+        }
+    } catch (e) { /* ignore */ }
+
     for (const triplet of triplets) {
         const meta = SNOTEL[triplet] || {};
         const latlng = [meta.lat, meta.lon];
 
         // Safely extract the values array from the AWDB response structure.
-        const raw = (data[triplet] && data[triplet][0] && data[triplet][0].data && data[triplet][0].data[0] && data[triplet][0].data[0].values) || [];
+        const raw = (data && data[triplet] && data[triplet][0] && data[triplet][0].data && data[triplet][0].data[0] && data[triplet][0].data[0].values) || [];
         const entries = raw.filter((v) => v && v.value != null && Number.isFinite(Number(v.value)));
         const deltaInfo = computeDelta(entries, beginDateObj);
+        // Collect timestamps so the badge can reflect the exact times used in popups
+        if (deltaInfo && deltaInfo.first && deltaInfo.last) {
+            try {
+                const fts = deltaInfo.first.timestamp;
+                const lts = deltaInfo.last.timestamp;
+                if (fts) {
+                    const fDate = new Date(fts);
+                    if (!isNaN(fDate)) {
+                        if (!badgeFirstDate || fDate < badgeFirstDate) { badgeFirstDate = fDate; badgeFirst = fts; }
+                    } else if (!badgeFirst) { badgeFirst = fts; }
+                }
+                if (lts) {
+                    const lDate = new Date(lts);
+                    if (!isNaN(lDate)) {
+                        if (!badgeLastDate || lDate > badgeLastDate) { badgeLastDate = lDate; badgeLast = lts; }
+                    } else if (!badgeLast) { badgeLast = lts; }
+                }
+            } catch (e) { /* ignore timestamp parsing errors */ }
+        }
         const stationName = (SNOTEL[triplet] && SNOTEL[triplet].name) || triplet;
 
         // Create a marker icon that displays the delta value
@@ -428,7 +687,8 @@ async function plotTodaysSwe(TimeBefore = TIME_COUNT, duration = 'HOURLY') {
             else if (d > 1.0) magnitudeClass = 'snotel-marker-purple';
         }
         const iconHtml = `<div class="snotel-pin ${magnitudeClass}"><span class="snotel-pin-label">${deltaLabel}</span></div>`;
-        const icon = L.divIcon({ className: 'snotel-div-icon', html: iconHtml, iconSize: [48, 48], iconAnchor: [24, 48] });
+        // Smaller icon size for less visual clutter
+        const icon = L.divIcon({ className: 'snotel-div-icon', html: iconHtml, iconSize: [32, 32], iconAnchor: [16, 32] });
         const marker = L.marker(latlng, { icon });
 
         let popupHtml;
@@ -452,11 +712,62 @@ async function plotTodaysSwe(TimeBefore = TIME_COUNT, duration = 'HOURLY') {
         else marker.addTo(map);
     }
 
+    // Update badge to reflect timestamps actually used in popups (if collected)
+    try {
+        const badge = document.getElementById('snotel-duration-badge');
+        if (badge && (badgeFirst || badgeLast)) {
+            const fromText = badgeFirst || (SNOTEL_BEGIN || beginDateStr);
+            const toText = badgeLast || (SNOTEL_END || computeEndDate());
+            badge.textContent = `From ${fromText} to ${toText}`;
+            badge.style.display = 'block';
+        }
+    } catch (e) { /* ignore */ }
+
     // hide loading overlay once markers are added (or attempted)
     hideLoading();
 
-    // add the duration control (if not present) so users can switch DAILY/HOURLY
-    addDurationControl();
+    // Zoom map to the plotted data. Prefer using SNOTEL_BY_STATE for the
+    // selected state when available (fast); otherwise derive bounds from
+    // the markers we added or from SNOTEL coordinates.
+    try {
+        if (map) {
+            let bounds = null;
+            if (selectedStates.length && window.SNOTEL_BY_STATE && typeof window.SNOTEL_BY_STATE === 'object') {
+                const pts = [];
+                for (const st of selectedStates) {
+                    if (Array.isArray(window.SNOTEL_BY_STATE[st])) {
+                        pts.push(...window.SNOTEL_BY_STATE[st].filter((r) => r && r.lat != null && r.lon != null).map((r) => [r.lat, r.lon]));
+                    }
+                }
+                if (pts.length) bounds = L.latLngBounds(pts);
+            }
+            if (!bounds && markersLayer && typeof markersLayer.getLayers === 'function') {
+                const layers = markersLayer.getLayers();
+                const latlngs = layers.map((m) => m.getLatLng()).filter(Boolean);
+                if (latlngs.length) bounds = L.latLngBounds(latlngs);
+            }
+            if (!bounds) {
+                // Last resort: compute from SNOTEL mapping
+                const pts = triplets
+                    .map((t) => {
+                        const m = SNOTEL[t];
+                        return m && m.lat != null && m.lon != null ? [m.lat, m.lon] : null;
+                    })
+                    .filter(Boolean);
+                if (pts.length) bounds = L.latLngBounds(pts);
+            }
+            if (bounds && bounds.isValid && bounds.isValid()) {
+                // Add slight padding and limit max zoom so markers remain visible
+                map.fitBounds(bounds.pad ? bounds.pad(0.08) : bounds, { maxZoom: 10 });
+            }
+        }
+    } catch (err) {
+        console.warn('Could not auto-fit map bounds:', err);
+    }
+
+    // Ensure radar follows visibility state of control when refreshing plot
+    const radarChk = document.getElementById('snotel-radar-toggle');
+    if (radarChk && radarChk.checked) setRadarOverlay(true);
 }
 
 /**
@@ -484,11 +795,14 @@ function addDurationControl() {
             header.appendChild(hdr);
             const ctlToggle = document.createElement('button');
             ctlToggle.className = 'control-toggle';
-            ctlToggle.setAttribute('aria-expanded', 'true');
-            ctlToggle.title = 'Collapse controls';
-            ctlToggle.innerHTML = '\u2212';
+            // default collapsed so the control panel is minimized on load
+            ctlToggle.setAttribute('aria-expanded', 'false');
+            ctlToggle.title = 'Expand controls';
+            ctlToggle.innerHTML = '+';
             header.appendChild(ctlToggle);
             container.appendChild(header);
+            // start collapsed by default
+            container.classList.add('collapsed');
 
             // content wrapper so it can be collapsed
             const content = document.createElement('div');
@@ -525,30 +839,190 @@ function addDurationControl() {
             });
             row.appendChild(basemapSelect);
 
+            // Radar overlay toggle (placed before the divider so it applies immediately)
+            const radarLabel = document.createElement('label');
+            radarLabel.style.display = 'inline-flex';
+            radarLabel.style.alignItems = 'center';
+            radarLabel.style.marginLeft = '6px';
+            radarLabel.style.marginRight = '8px';
+            radarLabel.style.fontSize = '13px';
+            const radarChk = document.createElement('input');
+            radarChk.type = 'checkbox';
+            radarChk.id = 'snotel-radar-toggle';
+            radarChk.style.marginRight = '6px';
+            radarLabel.appendChild(radarChk);
+            const radarText = document.createElement('span');
+            radarText.textContent = 'Show Radar';
+            radarLabel.appendChild(radarText);
+            // small status element to show radar availability/errors (adjacent to toggle)
+            const radarStatus = document.createElement('span');
+            radarStatus.id = 'snotel-radar-status';
+            radarStatus.className = 'small-note';
+            radarStatus.style.fontSize = '11px';
+            radarStatus.style.marginLeft = '6px';
+            radarStatus.textContent = '';
+            radarLabel.appendChild(radarStatus);
+
+            // Opacity slider (0-100%) shown next to radar control — only visible when radar is enabled
+            const opacityWrapper = document.createElement('span');
+            opacityWrapper.style.display = 'inline-flex';
+            opacityWrapper.style.alignItems = 'center';
+            opacityWrapper.style.marginLeft = '8px';
+
+            const opacityInput = document.createElement('input');
+            opacityInput.type = 'range';
+            opacityInput.id = 'snotel-radar-opacity';
+            opacityInput.min = '0';
+            opacityInput.max = '100';
+            opacityInput.style.marginLeft = '8px';
+            opacityInput.style.verticalAlign = 'middle';
+            opacityInput.title = 'Radar opacity';
+
+            const opacityLabel = document.createElement('span');
+            opacityLabel.id = 'snotel-radar-opacity-label';
+            opacityLabel.className = 'small-note';
+            opacityLabel.style.fontSize = '11px';
+            opacityLabel.style.marginLeft = '6px';
+
+            // initialize slider from localStorage if available
+            try {
+                const saved = localStorage.getItem(RADAR_OPACITY_KEY);
+                if (saved != null) {
+                    const v = Number(saved);
+                    if (!isNaN(v) && v >= 0 && v <= 1) RADAR_OPACITY = v;
+                }
+            } catch (e) { /* ignore localStorage */ }
+            opacityInput.value = String(Math.round(RADAR_OPACITY * 100));
+            opacityLabel.textContent = `${Math.round(RADAR_OPACITY * 100)}%`;
+
+            // hide slider when radar is not enabled
+            opacityWrapper.style.display = radarChk.checked ? 'inline-flex' : 'none';
+
+            // update opacity and persist on change
+            opacityInput.addEventListener('input', function () {
+                const pct = Number(this.value);
+                RADAR_OPACITY = Math.max(0, Math.min(1, pct / 100));
+                opacityLabel.textContent = `${Math.round(RADAR_OPACITY * 100)}%`;
+                try { localStorage.setItem(RADAR_OPACITY_KEY, String(RADAR_OPACITY)); } catch (e) { /* ignore */ }
+                if (radarLayer && typeof radarLayer.setOpacity === 'function') {
+                    radarLayer.setOpacity(RADAR_OPACITY);
+                }
+            });
+
+            opacityWrapper.appendChild(opacityInput);
+            opacityWrapper.appendChild(opacityLabel);
+
+            radarLabel.appendChild(opacityWrapper);
+
+            radarChk.addEventListener('change', function () {
+                setRadarOverlay(this.checked);
+                // show/hide opacity slider based on enabled state
+                opacityWrapper.style.display = this.checked ? 'inline-flex' : 'none';
+                // if toggling on, ensure opacity is applied
+                if (this.checked && radarLayer && typeof radarLayer.setOpacity === 'function') {
+                    radarLayer.setOpacity(RADAR_OPACITY);
+                }
+            });
+            row.appendChild(radarLabel);
+
             // visual divider between basemap selector and the datetime inputs
             const divider = document.createElement('div');
             divider.className = 'control-divider';
             divider.setAttribute('aria-hidden', 'true');
             row.appendChild(divider);
 
-            // State selector (unwired for now) placed immediately below the divider
+            // State selector (now supports multi-select) placed immediately below the divider
             const stateSelect = document.createElement('select');
             stateSelect.id = 'snotel-state-select';
+            stateSelect.multiple = true; // allow selecting more than one state
             stateSelect.style.fontSize = '13px';
             stateSelect.style.padding = '6px';
             stateSelect.style.borderRadius = '4px';
             stateSelect.style.border = '1px solid #cfcfcf';
+            // Show a few rows so users can see multiple choices; small width to keep panel compact
+            stateSelect.style.minWidth = '72px';
+            stateSelect.style.marginRight = '8px';
             stateSelect.style.marginBottom = '8px';
-            const states = ['AK', 'WA', 'ID', 'MT', 'OR', 'WY', 'CA', 'NV', 'UT', 'CO', 'NM', 'AZ'];
+            // Populate states from SNOTEL_BY_STATE when available (fast),
+            // otherwise derive from flat `SNOTEL` keys.
+            let states = [];
+            try {
+                if (window.SNOTEL_BY_STATE && typeof window.SNOTEL_BY_STATE === 'object') {
+                    states = Object.keys(window.SNOTEL_BY_STATE).map((s) => String(s).toUpperCase()).sort();
+                } else {
+                    const keys = Object.keys(window.SNOTEL || {});
+                    const sset = new Set();
+                    for (const k of keys) {
+                        const parts = String(k).split(':');
+                        if (parts[1]) sset.add(parts[1].toUpperCase());
+                    }
+                    states = Array.from(sset).sort();
+                }
+            } catch (e) {
+                // Fallback to a sensible default list when data isn't available
+                states = ['AK', 'WA', 'ID', 'MT', 'OR', 'WY', 'CA', 'NV', 'UT', 'CO', 'NM', 'AZ'];
+            }
             for (const s of states) {
                 const opt = document.createElement('option');
                 opt.value = s;
                 opt.textContent = s;
                 stateSelect.appendChild(opt);
             }
-            // default selection: MT
-            stateSelect.value = 'MT';
+            // Show a few rows so users can see multiple choices; set size now that `states` is known
+            stateSelect.size = Math.min(6, Math.max(3, states.length));
+            // default selection: prefer MT when available, otherwise select the first option
+            if (states.includes('MT')) {
+                for (const opt of stateSelect.options) { if (opt.value === 'MT') { opt.selected = true; break; } }
+            } else if (stateSelect.options.length) {
+                stateSelect.options[0].selected = true;
+            }
             row.appendChild(stateSelect);
+            // Small helper buttons to select/clear all states
+            const selectAllBtn = document.createElement('button');
+            selectAllBtn.type = 'button';
+            selectAllBtn.className = 'snotel-select-btn';
+            selectAllBtn.textContent = 'Select All';
+            selectAllBtn.title = 'Select all states';
+            selectAllBtn.style.fontSize = '12px';
+            selectAllBtn.style.padding = '4px 6px';
+            selectAllBtn.style.marginLeft = '8px';
+            selectAllBtn.style.marginTop = '6px';
+            selectAllBtn.style.border = '1px solid #cfcfcf';
+            selectAllBtn.style.backgroundColor = '#f3f3f3';
+            selectAllBtn.style.borderRadius = '4px';
+            selectAllBtn.style.cursor = 'pointer';
+            selectAllBtn.addEventListener('click', function (ev) {
+                ev.preventDefault();
+                for (const opt of stateSelect.options) opt.selected = true;
+                stateSelect.focus();
+            });
+            const clearBtn = document.createElement('button');
+            clearBtn.type = 'button';
+            clearBtn.className = 'snotel-clear-btn';
+            clearBtn.textContent = 'Clear';
+            clearBtn.title = 'Clear selected states';
+            clearBtn.style.fontSize = '12px';
+            clearBtn.style.padding = '4px 6px';
+            clearBtn.style.marginLeft = '4px';
+            clearBtn.style.marginTop = '6px';
+            clearBtn.style.border = '1px solid #cfcfcf';
+            clearBtn.style.backgroundColor = '#fff';
+            clearBtn.style.borderRadius = '4px';
+            clearBtn.style.cursor = 'pointer';
+            clearBtn.addEventListener('click', function (ev) {
+                ev.preventDefault();
+                for (const opt of stateSelect.options) opt.selected = false;
+                stateSelect.focus();
+            });
+            row.appendChild(selectAllBtn);
+            row.appendChild(clearBtn);
+            // The state change is applied when the user clicks "Apply" below.
+            const stateNote = document.createElement('div');
+            stateNote.className = 'small-note';
+            stateNote.style.marginLeft = '8px';
+            stateNote.style.display = 'inline-block';
+            stateNote.textContent = 'Choose one or more states (or use Select All/Clear) and click Apply to update map. Note: Selecting multiple states will take longer to load.';
+            row.appendChild(stateNote);
 
             const now = new Date();
             const defaultTo = toDatetimeLocal(now);
@@ -565,6 +1039,14 @@ function addDurationControl() {
             fromInput.style.borderRadius = '4px';
             fromInput.style.border = '1px solid #cfcfcf';
             row.appendChild(fromInput);
+
+            // A small note below the control to remind users about radar data coverage
+            const radarNote = document.createElement('div');
+            radarNote.className = 'small-note';
+            radarNote.style.fontSize = '11px';
+            radarNote.style.marginTop = '6px';
+            radarNote.textContent = 'Radar overlay may not cover all regions; tiles provided by RainViewer (public).';
+            content.appendChild(radarNote);
 
             const toInput = document.createElement('input');
             toInput.type = 'datetime-local';
@@ -603,6 +1085,14 @@ function addDurationControl() {
                 else SNOTEL_END = null;
                 const unitsEl = document.getElementById('snotel-duration-units');
                 if (unitsEl) unitsEl.textContent = SNOTEL_BEGIN && SNOTEL_END ? `From ${SNOTEL_BEGIN} to ${SNOTEL_END}` : `Custom range`;
+                // Let the main plot function update the badge based on actual data used
+                try {
+                    const badge = document.getElementById('snotel-duration-badge');
+                    if (badge) {
+                        badge.textContent = 'Updating...';
+                        badge.style.display = 'block';
+                    }
+                } catch (e) { /* ignore */ }
                 await plotTodaysSwe();
             });
             row.appendChild(applyBtn);
