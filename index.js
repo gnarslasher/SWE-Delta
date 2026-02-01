@@ -50,6 +50,7 @@ const RADAR_TILE_TEMPLATE = 'https://tilecache.rainviewer.com/v2/radar/{time}/25
 let radarTileErrorCount = 0;
 let radarTileLoadCount = 0;
 let radarTimestamp = null;
+let radarLoading = false;
 // Default opacity (0.0 - 1.0). Persisted in localStorage under this key.
 let RADAR_OPACITY = 0.6;
 const RADAR_OPACITY_KEY = 'snotelRadarOpacity';
@@ -511,6 +512,7 @@ async function setRadarOverlay(show) {
         if (radarLayer) {
             try { map.removeLayer(radarLayer); } catch (e) { /* ignore */ }
             radarLayer = null;
+            radarLoading = false;
         }
         if (statusEl) statusEl.textContent = '';
         try {
@@ -520,12 +522,44 @@ async function setRadarOverlay(show) {
         return;
     }
 
+    // guard against concurrent radar loads
+    if (radarLoading) {
+        if (statusEl) statusEl.textContent = 'Radar loading...';
+        return;
+    }
+
     radarTileErrorCount = 0;
     radarTileLoadCount = 0;
 
-    // add initial layer (placeholder time will be updated once we fetch latest)
-    const initialUrl = RADAR_TILE_TEMPLATE.replace('{time}', radarTimestamp || '0');
-    radarLayer = L.tileLayer(initialUrl, { pane: 'radarPane', opacity: RADAR_OPACITY, attribution: 'Radar © RainViewer' });
+    // fetch latest timestamp before creating the layer to avoid immediate tile errors
+    try {
+        if (statusEl) statusEl.textContent = 'Loading radar...';
+        radarLoading = true;
+        const latest = await fetchRainViewerLatestTime();
+        radarLoading = false;
+        if (!latest) {
+            if (statusEl) statusEl.textContent = 'Radar unavailable';
+            try {
+                const chk = document.getElementById('snotel-radar-toggle');
+                if (chk) chk.checked = false;
+            } catch (ex) { /* ignore */ }
+            return;
+        }
+        radarTimestamp = latest;
+    } catch (e) {
+        radarLoading = false;
+        console.warn('Error fetching radar timestamp:', e);
+        if (statusEl) statusEl.textContent = 'Radar unavailable';
+        try {
+            const chk = document.getElementById('snotel-radar-toggle');
+            if (chk) chk.checked = false;
+        } catch (ex) { /* ignore */ }
+        return;
+    }
+
+    // Create layer with the fetched timestamp
+    const url = RADAR_TILE_TEMPLATE.replace('{time}', radarTimestamp);
+    radarLayer = L.tileLayer(url, { pane: 'radarPane', opacity: RADAR_OPACITY, attribution: 'Radar © RainViewer' });
 
     radarLayer.on('tileerror', function (ev) {
         radarTileErrorCount += 1;
@@ -537,6 +571,7 @@ async function setRadarOverlay(show) {
             // If too many errors, remove layer and notify user
             try { map.removeLayer(radarLayer); } catch (e) { /* ignore */ }
             radarLayer = null;
+            radarLoading = false;
             if (statusEl) statusEl.textContent = 'Radar unavailable';
             try {
                 const chk = document.getElementById('snotel-radar-toggle');
@@ -558,18 +593,6 @@ async function setRadarOverlay(show) {
         if (opacityEl && opacityEl.parentElement) opacityEl.parentElement.style.display = 'inline-flex';
         if (radarLayer && typeof radarLayer.setOpacity === 'function') radarLayer.setOpacity(RADAR_OPACITY);
     } catch (e) { /* ignore */ }
-
-    // fetch latest timestamp and update the layer URL
-    try {
-        const latest = await fetchRainViewerLatestTime();
-        if (latest) {
-            radarTimestamp = latest;
-            const updatedUrl = RADAR_TILE_TEMPLATE.replace('{time}', latest);
-            if (radarLayer && typeof radarLayer.setUrl === 'function') radarLayer.setUrl(updatedUrl);
-        }
-    } catch (e) {
-        console.warn('Error updating radar layer time:', e);
-    }
 }
 
 /**
@@ -852,7 +875,7 @@ function addDurationControl() {
             radarChk.style.marginRight = '6px';
             radarLabel.appendChild(radarChk);
             const radarText = document.createElement('span');
-            radarText.textContent = 'Show Radar';
+            radarText.textContent = 'Show Current Radar';
             radarLabel.appendChild(radarText);
             // small status element to show radar availability/errors (adjacent to toggle)
             const radarStatus = document.createElement('span');
@@ -1021,7 +1044,7 @@ function addDurationControl() {
             stateNote.className = 'small-note';
             stateNote.style.marginLeft = '8px';
             stateNote.style.display = 'inline-block';
-            stateNote.textContent = 'Choose one or more states (or use Select All/Clear) and click Apply to update map. Note: Selecting multiple states will take longer to load.';
+            stateNote.textContent = 'Choose one or more states (or use Select All/Clear) and click Apply to update map. Selecting multiple states will take longer to load.';
             row.appendChild(stateNote);
 
             const now = new Date();

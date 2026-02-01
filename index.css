@@ -348,14 +348,18 @@ body {
     box-shadow: 0 8px 20px rgba(12,30,40,0.22);
 }
 .main-header-inner {
+    width: 100%;
     max-width: 1200px;
     margin: 0 auto;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
+    box-sizing: border-box;
 }
-.title-wrap { display: flex; flex-direction: column; }
+.title-wrap { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.main-title { word-break: break-word; }
+
 .main-title {
     margin: 0;
     font-size: 2rem; /* increased size */
@@ -385,10 +389,12 @@ body {
 .snowflake:hover { transform: rotate(10deg) scale(1.03); transition: transform 220ms ease; }
 
 @media (max-width: 640px) {
-    .main-header-inner { flex-direction: column; align-items: flex-start; }
-    .snowflake { align-self: flex-end; }
+    .main-header-inner { flex-direction: column; align-items: stretch; padding: 0 12px; }
+    .snowflake { align-self: flex-end; margin-top: 8px; }
     .main-title { font-size: 1.4rem; }
     .main-header .snotel-subtitle { font-size: 1rem; }
+    /* ensure title can shrink to allow snowflake to remain visible */
+    .title-wrap { min-width: 0; }
 }
 
 /* Tablet breakpoint: make control panel more flexible */
@@ -457,4 +463,37 @@ body {
 /* Ensure map container can shrink properly on very small viewports */
 @media (max-height: 500px) {
     #leaflet_map { min-height: 200px; }
+}
+
+/* Ensure badge and legend remain visible on small screens and account for safe-area insets */
+.snotel-duration-badge {
+    left: 8px;
+    bottom: calc(8px + env(safe-area-inset-bottom, 8px));
+    z-index: 1200;
+}
+
+.snotel-legend {
+    position: absolute;
+    right: 8px;
+    bottom: calc(8px + env(safe-area-inset-bottom, 8px));
+    max-width: calc(100% - 16px);
+    z-index: 1200;
+}
+
+@media (max-width: 640px) {
+    .snotel-duration-badge {
+        left: 8px;
+        bottom: calc(8px + env(safe-area-inset-bottom, 8px));
+        font-size: 11px;
+        padding: 6px 8px;
+    }
+    .snotel-legend {
+        right: 8px;
+        left: 8px;
+        bottom: calc(48px + env(safe-area-inset-bottom, 8px));
+        max-width: calc(100% - 16px);
+        width: auto;
+        box-sizing: border-box;
+    }
+    .snotel-legend .legend-content { font-size: 12px; }
 }
