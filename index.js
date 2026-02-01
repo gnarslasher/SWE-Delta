@@ -716,10 +716,12 @@ async function plotTodaysSwe(TimeBefore = TIME_COUNT, duration = 'HOURLY') {
 
         let popupHtml;
         if (!deltaInfo) {
-            popupHtml = `<div class="popup-header">${escapeHtml(stationName)}</div><div class="popup-body"><div class="popup-row"><span class="popup-label">SWE Delta:</span> <span class="popup-value">N/A</span></div></div>`;
+            const hourlyUrl = `https://wcc.sc.egov.usda.gov/reportGenerator/view/customSingleStationReport/hourly/${encodeURIComponent(triplet)}/-167,0/WTEQ::value,SNWD::value,PREC::value,TOBS::value`;
+            popupHtml = `<div class="popup-header">${escapeHtml(stationName)}</div><div class="popup-body"><div class="popup-row"><span class="popup-label">SWE Delta:</span> <span class="popup-value">N/A</span></div></div><div class="popup-footer"><a class="snotel-hourly-link" href="${escapeHtml(hourlyUrl)}" target="_blank" rel="noopener noreferrer">7 day hourly</a></div>`;
         } else {
             const firstTs = deltaInfo.first.timestamp || 'unknown';
             const lastTs = deltaInfo.last.timestamp || 'unknown';
+            const hourlyUrl = `https://wcc.sc.egov.usda.gov/reportGenerator/view/customSingleStationReport/hourly/${encodeURIComponent(triplet)}/-167,0/WTEQ::value,SNWD::value,PREC::value,TOBS::value`;
             popupHtml = `
                 <div class="popup-header">${escapeHtml(stationName)}</div>
                 <div class="popup-body">
@@ -727,7 +729,8 @@ async function plotTodaysSwe(TimeBefore = TIME_COUNT, duration = 'HOURLY') {
                     <div class="popup-row"><span class="popup-label">To:</span> <span class="popup-value">${escapeHtml(String(deltaInfo.last.value))}</span> <span class="popup-ts">${escapeHtml(String(lastTs))}</span></div>
                     <div class="popup-divider" aria-hidden="true"></div>
                     <div class="popup-row"><span class="popup-label">SWE Delta:</span> <span class="popup-value">${escapeHtml(String(deltaInfo.delta))}</span></div>
-                </div>`;
+                </div>
+                <div class="popup-footer"><a class="snotel-hourly-link" href="${escapeHtml(hourlyUrl)}" target="_blank" rel="noopener noreferrer">7-Day Hourly Data Report</a></div>`;
         }
         // Larger popup for readability; add className so CSS styles apply
         marker.bindPopup(popupHtml, { minWidth: 260, maxWidth: 640, maxHeight: 400, className: 'snotel-popup' });
